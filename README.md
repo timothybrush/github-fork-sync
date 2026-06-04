@@ -29,7 +29,7 @@ Clone and install with [uv](https://docs.astral.sh/uv/):
 
 ```sh
 git clone <this-repo>
-cd update
+cd github-fork-sync
 uv sync
 ```
 
