@@ -7,11 +7,12 @@ If you maintain dozens — or hundreds — of forks, manually clicking "Sync for
 ## What it does
 
 1. Lists every repository you own that is a fork (paginated via GraphQL, 25 at a time).
-2. Skips forks whose upstream has not been pushed to since the last successful run (timestamp persisted in `sync_state.json`).
-3. For each remaining fork, asks GitHub how many commits behind upstream it is.
-4. Calls the [`/merge-upstream`](https://docs.github.com/en/rest/branches/branches#sync-a-fork-branch-with-the-upstream-repository) endpoint to fast-forward the fork's default branch.
-5. Classifies the outcome as synced, merge conflict, no-op (API cache artifact), or error.
-6. Posts a grouped Slack report — only when something actually happened.
+2. Skips forks whose upstream has not been pushed to since the last successful run (timestamp persisted in `sync_state.json`) — **except** forks left in a merge conflict last run, which are always re-checked so an unresolved conflict can't be silently hidden by the timestamp cache.
+3. For each remaining fork, asks GitHub how many commits behind its upstream's default branch it is (the fork and upstream may use different default branch names).
+4. Calls the [`/merge-upstream`](https://docs.github.com/en/rest/branches/branches#sync-a-fork-branch-with-the-upstream-repository) endpoint to fast-forward the fork's default branch. A reported conflict (HTTP 409) is re-confirmed once after a short delay, since GitHub's cached merge state can be transiently stale right after an upstream push.
+5. Classifies the outcome as synced, merge conflict, transient/flaky conflict (cleared on re-check), no-op (API cache artifact), or error.
+6. Tracks conflicts across runs: reports how long each has been unresolved, and flags conflicts that cleared on their own since the last run.
+7. Posts a grouped Slack report — only when something actually happened.
 
 Transient `429` / `5xx` responses and GitHub's secondary rate limits are retried with exponential backoff, honoring `Retry-After` when present.
 
@@ -75,11 +76,20 @@ The report is sent only when at least one fork was synced, hit a merge conflict,
 • 1 commit: `tiny-repo`
 
 *Merge Conflicts (Manual Resolution Required):*
-• `divergent-repo`
+• `divergent-repo` — unresolved across 4 runs (first seen 2026-06-08 09:12 UTC)
+• `new-conflict-repo` — new this run
+
+*Conflicts Cleared Since Last Run:*
+• `flapping-repo` — cleared without intervention after being flagged 2 runs (first seen 2026-06-08 08:30 UTC)
+
+*Transient Conflicts (cleared on in-run re-check):*
+• `racey-repo`
 
 *Errors Encountered:*
 • broken-repo: <error message from GitHub>
 ```
+
+The **Conflicts Cleared Since Last Run** and **Transient Conflicts** sections are the telemetry that answers "was it really a conflict?": a repo that clears on the in-run re-check was GitHub merge-state flicker, while one that clears across runs without intervention was either resolved upstream or eventual consistency. A conflict that keeps incrementing its run count is genuine and needs manual resolution.
 
 If every fork is already up to date, no Slack notification is sent.
 

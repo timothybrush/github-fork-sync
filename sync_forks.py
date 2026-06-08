@@ -32,6 +32,7 @@ console = Console()
 STATE_FILE = Path(__file__).resolve().parent / "sync_state.json"
 TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
 MAX_RETRIES = 5
+CONFLICT_RECHECK_DELAY = 3  # seconds to wait before re-confirming a 409, to filter out flicker
 
 FORKS_QUERY = """
 query($endCursor: String) {
@@ -61,6 +62,7 @@ class SyncResult:
     conflict: bool = False
     no_op: bool = False  # API reported the fork as behind, but the merge was a no-op
     error: str = ""
+    flaky: bool = False  # first merge-upstream returned 409, but a re-confirm cleared it
 
 
 class GitHub:
@@ -123,21 +125,47 @@ class GitHub:
                 cursor = repos["pageInfo"]["endCursor"]
                 time.sleep(0.5)  # gentle pacing to avoid secondary rate limits
 
-    def commits_behind(self, repo: str, branch: str, upstream_owner: str) -> int:
-        """Number of commits `repo` is behind its upstream on `branch` (0 if unknown)."""
-        response = self._request(
-            "GET", f"/repos/{repo}/compare/{branch}...{upstream_owner}:{branch}"
-        )
-        return response.json().get("ahead_by", 0) if response.is_success else 0
+    def commits_behind(
+        self, repo: str, branch: str, upstream_owner: str, upstream_branch: str
+    ) -> int | None:
+        """Commits `repo` is behind upstream; None if GitHub wouldn't tell us.
 
-    def sync_fork(self, repo: str, branch: str) -> SyncResult:
-        """Merge upstream changes into `repo`/`branch`."""
+        Compares the fork's branch against the upstream's *own* default branch — the
+        two may be named differently (e.g. `master` vs `main`). A non-success response
+        returns None (unknown) rather than 0, so callers don't mistake an API failure
+        for "up to date" and silently skip a fork that is actually behind.
+        """
+        response = self._request(
+            "GET", f"/repos/{repo}/compare/{branch}...{upstream_owner}:{upstream_branch}"
+        )
+        return response.json().get("ahead_by", 0) if response.is_success else None
+
+    def _merge_upstream(self, repo: str, branch: str) -> SyncResult:
+        """Single POST to the merge-upstream endpoint."""
         response = self._request("POST", f"/repos/{repo}/merge-upstream", json={"branch": branch})
         if response.is_success:
             return SyncResult(success=True, no_op=response.json().get("merge_type") == "none")
         if response.status_code == 409:
             return SyncResult(success=False, conflict=True)
         return SyncResult(success=False, error=response.text.strip())
+
+    def sync_fork(self, repo: str, branch: str) -> SyncResult:
+        """Merge upstream into `repo`/`branch`, re-confirming any reported conflict.
+
+        GitHub computes mergeability against internally cached git data that can be
+        transiently stale right after an upstream push, occasionally yielding a bogus
+        409. We re-confirm a conflict once after a short delay; if the second attempt
+        succeeds, the conflict was a flicker and we mark the result `flaky` instead of
+        crying wolf.
+        """
+        result = self._merge_upstream(repo, branch)
+        if not result.conflict:
+            return result
+        time.sleep(CONFLICT_RECHECK_DELAY)
+        confirmed = self._merge_upstream(repo, branch)
+        if not confirmed.conflict and not confirmed.error:
+            confirmed.flaky = True
+        return confirmed
 
 
 def resolve_token() -> str:
@@ -151,22 +179,31 @@ def resolve_token() -> str:
     sys.exit(1)
 
 
-def load_last_run() -> datetime | None:
-    """Read the timestamp of the last successful run, if any."""
+def load_state() -> tuple[datetime | None, dict[str, dict[str, Any]]]:
+    """Read the last run timestamp and the forks left in conflict last run.
+
+    Tolerant of the older state format that only stored `last_run` — a missing
+    `conflicts` key simply yields an empty mapping.
+    """
     if not STATE_FILE.exists():
-        return None
+        return None, {}
     try:
-        return datetime.fromisoformat(json.loads(STATE_FILE.read_text())["last_run"])
-    except (KeyError, ValueError, json.JSONDecodeError) as exc:
+        data = json.loads(STATE_FILE.read_text())
+        raw_last_run = data.get("last_run")
+        last_run = datetime.fromisoformat(raw_last_run) if raw_last_run else None
+        return last_run, data.get("conflicts", {})
+    except (ValueError, json.JSONDecodeError) as exc:
         console.print(
             f"[dim yellow]Warning: couldn't read state file ({exc}); forcing full check.[/]"
         )
-        return None
+        return None, {}
 
 
-def save_last_run(run_time: datetime) -> None:
-    """Persist this run's start time as the baseline for the next run."""
-    STATE_FILE.write_text(json.dumps({"last_run": run_time.isoformat()}))
+def save_state(run_time: datetime, conflicts: dict[str, dict[str, Any]]) -> None:
+    """Persist this run's start time and any still-conflicting forks for the next run."""
+    STATE_FILE.write_text(
+        json.dumps({"last_run": run_time.isoformat(), "conflicts": conflicts}, indent=2)
+    )
 
 
 def upstream_changed(parent: dict[str, Any], last_run: datetime | None) -> bool:
@@ -177,8 +214,36 @@ def upstream_changed(parent: dict[str, Any], last_run: datetime | None) -> bool:
     return True
 
 
+def should_check(
+    parent: dict[str, Any], last_run: datetime | None, was_conflicted: bool
+) -> bool:
+    """Whether a fork warrants a sync attempt this run.
+
+    A fork is checked when upstream has moved since our last run *or* when it was
+    left in a merge conflict last run. Re-checking conflicts every run — regardless
+    of upstream activity — is what stops an unresolved (or since-resolved) conflict
+    from being silently hidden by the upstream-activity cache: once a conflict is
+    reported, upstream's `pushedAt` no longer advances past our baseline, so the
+    plain timestamp gate would skip the fork forever and the conflict would appear
+    to "vanish" on the next run.
+    """
+    return was_conflicted or upstream_changed(parent, last_run)
+
+
+def _format_ts(iso: str) -> str:
+    """Render an ISO timestamp as a compact UTC date for Slack."""
+    try:
+        return f"{datetime.fromisoformat(iso):%Y-%m-%d %H:%M} UTC"
+    except ValueError:
+        return iso or "unknown"
+
+
 def build_report(
-    synced: dict[int, list[str]], conflicts: list[str], errors: list[str]
+    synced: dict[int, list[str]],
+    conflicts: list[tuple[str, int, str]],
+    errors: list[str],
+    resolved: list[tuple[str, dict[str, Any]]],
+    flaky: list[str],
 ) -> list[str]:
     """Assemble the Slack report body from the run's results."""
     lines = ["*GitHub Fork Sync Report*"]
@@ -186,10 +251,31 @@ def build_report(
         lines.append("\n*✅ Synced Repositories:*")
         for count in sorted(synced, reverse=True):
             repos = ", ".join(f"`{name}`" for name in synced[count])
-            lines.append(f"• {count} {'commit' if count == 1 else 'commits'}: {repos}")
+            if count < 0:
+                lines.append(f"• unknown commit count: {repos}")
+            else:
+                lines.append(f"• {count} {'commit' if count == 1 else 'commits'}: {repos}")
     if conflicts:
         lines.append("\n*⚠️ Merge Conflicts (Manual Resolution Required):*")
-        lines.append("• " + ", ".join(f"`{name}`" for name in conflicts))
+        for name, runs, first_seen in conflicts:
+            if runs <= 1:
+                lines.append(f"• `{name}` — new this run")
+            else:
+                lines.append(
+                    f"• `{name}` — unresolved across {runs} runs "
+                    f"(first seen {_format_ts(first_seen)})"
+                )
+    if resolved:
+        lines.append("\n*🔄 Conflicts Cleared Since Last Run:*")
+        for name, prior in resolved:
+            runs = prior.get("runs", 1)
+            lines.append(
+                f"• `{name}` — cleared without intervention after being flagged {runs} "
+                f"{'run' if runs == 1 else 'runs'} (first seen {_format_ts(prior.get('first_seen', ''))})"
+            )
+    if flaky:
+        lines.append("\n*♻️ Transient Conflicts (cleared on in-run re-check):*")
+        lines.append("• " + ", ".join(f"`{name}`" for name in flaky))
     if errors:
         lines.append("\n*❌ Errors Encountered:*")
         lines.extend(f"• {err}" for err in errors)
@@ -206,7 +292,7 @@ def notify_slack(webhook_url: str, lines: list[str]) -> None:
 
 def main() -> None:
     started_at = datetime.now(timezone.utc)
-    last_run = load_last_run()
+    last_run, prior_conflicts = load_state()
 
     if not (webhook_url := os.getenv("SLACK_WEBHOOK_URL")):
         console.print("[red]Error: SLACK_WEBHOOK_URL environment variable is not set.[/red]")
@@ -227,8 +313,11 @@ def main() -> None:
     total = len(forks)
     reviewed = synced = skipped = 0
     synced_by_count: dict[int, list[str]] = {}
-    conflicts: list[str] = []
+    conflicts: list[tuple[str, int, str]] = []
     errors: list[str] = []
+    resolved: list[tuple[str, dict[str, Any]]] = []
+    flaky: list[str] = []
+    current_conflicts: dict[str, dict[str, Any]] = {}
 
     with Progress(
         SpinnerColumn(),
@@ -245,6 +334,7 @@ def main() -> None:
             short = repo.rsplit("/", 1)[-1]
             branch = (fork.get("defaultBranchRef") or {}).get("name", "main")
             parent = fork.get("parent")
+            was_conflicted = repo in prior_conflicts
 
             progress.update(
                 task,
@@ -255,35 +345,68 @@ def main() -> None:
                 ),
             )
 
-            if parent and upstream_changed(parent, last_run):
-                behind = github.commits_behind(repo, branch, parent["owner"]["login"])
-                if behind:
+            if parent and should_check(parent, last_run, was_conflicted):
+                upstream_branch = (parent.get("defaultBranchRef") or {}).get("name") or branch
+                behind = github.commits_behind(
+                    repo, branch, parent["owner"]["login"], upstream_branch
+                )
+                if behind == 0:
+                    # Fully up to date; if it was flagged before, the conflict cleared itself.
+                    if was_conflicted:
+                        resolved.append((short, prior_conflicts[repo]))
+                else:
+                    # behind > 0, or None (compare unreadable) — let merge-upstream decide.
                     result = github.sync_fork(repo, branch)
                     if result.conflict:
-                        conflicts.append(short)
+                        prior = prior_conflicts.get(repo, {})
+                        runs = prior.get("runs", 0) + 1
+                        first_seen = prior.get("first_seen", started_at.isoformat())
+                        current_conflicts[repo] = {"first_seen": first_seen, "runs": runs}
+                        conflicts.append((short, runs, first_seen))
                     elif result.error:
                         errors.append(f"{short}: {result.error}")
+                        if was_conflicted:  # keep tracking until it truly clears
+                            current_conflicts[repo] = prior_conflicts[repo]
                     elif result.no_op:
                         progress.console.print(
                             f"\n[dim yellow]Ignored {short}: API cache artifact "
                             f"(reported behind, but up to date).[/]"
                         )
+                        if was_conflicted:
+                            resolved.append((short, prior_conflicts[repo]))
                     elif result.success:
                         synced += 1
-                        synced_by_count.setdefault(behind, []).append(short)
+                        synced_by_count.setdefault(behind if behind is not None else -1, []).append(
+                            short
+                        )
+                        if result.flaky:
+                            flaky.append(short)
+                        if was_conflicted:
+                            resolved.append((short, prior_conflicts[repo]))
             elif parent:
                 skipped += 1
 
             progress.advance(task)
 
-    save_last_run(started_at)
+    save_state(started_at, current_conflicts)
     console.print(
         f"\n[bold green]Sync complete. {skipped} repos bypassed via state caching.[/bold green]"
     )
+    if resolved:
+        console.print(
+            f"[dim]{len(resolved)} previously-conflicting repo(s) cleared since last run.[/dim]"
+        )
+    if current_conflicts:
+        console.print(
+            f"[dim]{len(current_conflicts)} repo(s) still in conflict; "
+            f"will be re-checked next run regardless of upstream activity.[/dim]"
+        )
 
-    if synced_by_count or conflicts or errors:
+    if synced_by_count or conflicts or errors or resolved or flaky:
         console.print("Sending Slack notification…")
-        notify_slack(webhook_url, build_report(synced_by_count, conflicts, errors))
+        notify_slack(
+            webhook_url, build_report(synced_by_count, conflicts, errors, resolved, flaky)
+        )
     else:
         console.print(
             "[bold green]All active forks are up to date. No Slack notification sent.[/bold green]"
