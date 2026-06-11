@@ -33,6 +33,7 @@ STATE_FILE = Path(__file__).resolve().parent / "sync_state.json"
 TRANSIENT_STATUSES = {429, 500, 502, 503, 504}
 MAX_RETRIES = 5
 CONFLICT_RECHECK_DELAY = 3  # seconds to wait before re-confirming a 409, to filter out flicker
+AUTO_RESOLVE_AFTER_RUNS = 5  # auto-resolve a conflict once it has persisted strictly more runs than this
 
 FORKS_QUERY = """
 query($endCursor: String) {
@@ -63,6 +64,20 @@ class SyncResult:
     no_op: bool = False  # API reported the fork as behind, but the merge was a no-op
     error: str = ""
     flaky: bool = False  # first merge-upstream returned 409, but a re-confirm cleared it
+
+
+@dataclass
+class Divergence:
+    """How a fork's default branch relates to its upstream, per the compare API."""
+
+    behind: int  # commits the fork is behind upstream (upstream has, fork lacks)
+    diverged: int  # the fork's own commits upstream lacks — discarded on auto-resolve
+    merge_base_sha: str  # the common ancestor; reset target for auto-resolution
+
+
+def should_auto_resolve(runs: int) -> bool:
+    """Whether a conflict that has persisted `runs` runs is due for auto-resolution."""
+    return runs > AUTO_RESOLVE_AFTER_RUNS
 
 
 class GitHub:
@@ -167,6 +182,53 @@ class GitHub:
             confirmed.flaky = True
         return confirmed
 
+    def upstream_divergence(
+        self, repo: str, branch: str, upstream_owner: str, upstream_branch: str
+    ) -> Divergence | None:
+        """How `repo`/`branch` diverges from upstream; None if GitHub wouldn't tell us.
+
+        A single compare with the fork's branch as base and upstream as head: the
+        compare's `ahead_by` is how far upstream is ahead of the fork (fork behind),
+        `behind_by` is how many commits the fork has that upstream lacks (the
+        divergent commits we'd discard), and `merge_base_commit.sha` is their common
+        ancestor — the ref we reset to so the branch can fast-forward again.
+        """
+        response = self._request(
+            "GET", f"/repos/{repo}/compare/{branch}...{upstream_owner}:{upstream_branch}"
+        )
+        if not response.is_success:
+            return None
+        data = response.json()
+        merge_base = (data.get("merge_base_commit") or {}).get("sha")
+        if not merge_base:
+            return None
+        return Divergence(
+            behind=data.get("ahead_by", 0),
+            diverged=data.get("behind_by", 0),
+            merge_base_sha=merge_base,
+        )
+
+    def reset_branch(self, repo: str, branch: str, sha: str) -> httpx.Response:
+        """Force-move `repo`/`branch` to point at `sha` (a non-fast-forward update)."""
+        return self._request(
+            "PATCH",
+            f"/repos/{repo}/git/refs/heads/{branch}",
+            json={"sha": sha, "force": True},
+        )
+
+    def force_resolve(self, repo: str, branch: str, merge_base_sha: str) -> SyncResult:
+        """Discard the fork's divergent commits, then fast-forward to upstream.
+
+        Resets the branch back to its merge-base with upstream (dropping the fork's
+        own commits that made it unmergeable), then runs merge-upstream to fast-
+        forward up to the latest upstream. A failure at either step is surfaced so
+        the caller keeps tracking the conflict rather than declaring a false win.
+        """
+        reset = self.reset_branch(repo, branch, merge_base_sha)
+        if not reset.is_success:
+            return SyncResult(success=False, error=f"branch reset failed: {reset.text.strip()}")
+        return self._merge_upstream(repo, branch)
+
 
 def resolve_token() -> str:
     """Use $GITHUB_TOKEN if set, otherwise fall back to the gh CLI's stored token."""
@@ -244,8 +306,10 @@ def build_report(
     errors: list[str],
     resolved: list[tuple[str, dict[str, Any]]],
     flaky: list[str],
+    force_resolved: list[tuple[str, int, int]] | None = None,
 ) -> list[str]:
     """Assemble the Slack report body from the run's results."""
+    force_resolved = force_resolved or []
     lines = ["*GitHub Fork Sync Report*"]
     if synced:
         lines.append("\n*✅ Synced Repositories:*")
@@ -255,6 +319,14 @@ def build_report(
                 lines.append(f"• unknown commit count: {repos}")
             else:
                 lines.append(f"• {count} {'commit' if count == 1 else 'commits'}: {repos}")
+    if force_resolved:
+        lines.append("\n*🛠️ Auto-Resolved Conflicts (divergent commits discarded to fast-forward):*")
+        for name, runs, diverged in force_resolved:
+            commits = f"{diverged} {'commit' if diverged == 1 else 'commits'}"
+            lines.append(
+                f"• `{name}` — discarded {commits} and fast-forwarded "
+                f"after {runs} {'run' if runs == 1 else 'runs'} in conflict"
+            )
     if conflicts:
         lines.append("\n*⚠️ Merge Conflicts (Manual Resolution Required):*")
         for name, runs, first_seen in conflicts:
@@ -317,6 +389,7 @@ def main() -> None:
     errors: list[str] = []
     resolved: list[tuple[str, dict[str, Any]]] = []
     flaky: list[str] = []
+    force_resolved: list[tuple[str, int, int]] = []
     current_conflicts: dict[str, dict[str, Any]] = {}
 
     with Progress(
@@ -361,8 +434,35 @@ def main() -> None:
                         prior = prior_conflicts.get(repo, {})
                         runs = prior.get("runs", 0) + 1
                         first_seen = prior.get("first_seen", started_at.isoformat())
-                        current_conflicts[repo] = {"first_seen": first_seen, "runs": runs}
-                        conflicts.append((short, runs, first_seen))
+                        if should_auto_resolve(runs):
+                            # Persisted past the threshold: discard the fork's divergent
+                            # commits (reset to the merge-base) and fast-forward upstream.
+                            div = github.upstream_divergence(
+                                repo, branch, parent["owner"]["login"], upstream_branch
+                            )
+                            outcome = (
+                                github.force_resolve(repo, branch, div.merge_base_sha)
+                                if div is not None
+                                else SyncResult(
+                                    success=False,
+                                    error="compare unreadable; cannot locate merge-base",
+                                )
+                            )
+                            if outcome.success:
+                                force_resolved.append((short, runs, div.diverged))
+                                progress.console.print(
+                                    f"\n[yellow]Auto-resolved {short}: discarded "
+                                    f"{div.diverged} divergent commit(s) and fast-forwarded "
+                                    f"after {runs} runs in conflict.[/]"
+                                )
+                                # Conflict cleared — intentionally not carried forward.
+                            else:
+                                current_conflicts[repo] = {"first_seen": first_seen, "runs": runs}
+                                conflicts.append((short, runs, first_seen))
+                                errors.append(f"{short}: auto-resolve failed: {outcome.error}")
+                        else:
+                            current_conflicts[repo] = {"first_seen": first_seen, "runs": runs}
+                            conflicts.append((short, runs, first_seen))
                     elif result.error:
                         errors.append(f"{short}: {result.error}")
                         if was_conflicted:  # keep tracking until it truly clears
@@ -396,16 +496,24 @@ def main() -> None:
         console.print(
             f"[dim]{len(resolved)} previously-conflicting repo(s) cleared since last run.[/dim]"
         )
+    if force_resolved:
+        console.print(
+            f"[dim]{len(force_resolved)} stale conflict(s) auto-resolved by discarding "
+            f"divergent commits and fast-forwarding.[/dim]"
+        )
     if current_conflicts:
         console.print(
             f"[dim]{len(current_conflicts)} repo(s) still in conflict; "
             f"will be re-checked next run regardless of upstream activity.[/dim]"
         )
 
-    if synced_by_count or conflicts or errors or resolved or flaky:
+    if synced_by_count or conflicts or errors or resolved or flaky or force_resolved:
         console.print("Sending Slack notification…")
         notify_slack(
-            webhook_url, build_report(synced_by_count, conflicts, errors, resolved, flaky)
+            webhook_url,
+            build_report(
+                synced_by_count, conflicts, errors, resolved, flaky, force_resolved
+            ),
         )
     else:
         console.print(

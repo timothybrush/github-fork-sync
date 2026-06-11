@@ -12,7 +12,8 @@ If you maintain dozens — or hundreds — of forks, manually clicking "Sync for
 4. Calls the [`/merge-upstream`](https://docs.github.com/en/rest/branches/branches#sync-a-fork-branch-with-the-upstream-repository) endpoint to fast-forward the fork's default branch. A reported conflict (HTTP 409) is re-confirmed once after a short delay, since GitHub's cached merge state can be transiently stale right after an upstream push.
 5. Classifies the outcome as synced, merge conflict, transient/flaky conflict (cleared on re-check), no-op (API cache artifact), or error.
 6. Tracks conflicts across runs: reports how long each has been unresolved, and flags conflicts that cleared on their own since the last run.
-7. Posts a grouped Slack report — only when something actually happened.
+7. **Auto-resolves stale conflicts.** Once a fork has been in conflict for more than 5 runs, the script discards the fork's own divergent commits — resetting its default branch to the merge-base with upstream — and fast-forwards it to the latest upstream. This is automatic and **destructive**: the fork's commits on its default branch are permanently dropped. It only triggers after a conflict has gone unresolved across 6+ runs, and applies only to your own forks.
+8. Posts a grouped Slack report — only when something actually happened.
 
 Transient `429` / `5xx` responses and GitHub's secondary rate limits are retried with exponential backoff, honoring `Retry-After` when present.
 
@@ -74,6 +75,9 @@ The report is sent only when at least one fork was synced, hit a merge conflict,
 • 14 commits: `some-repo`
 • 3 commits: `another-repo`, `third-repo`
 • 1 commit: `tiny-repo`
+
+*Auto-Resolved Conflicts (divergent commits discarded to fast-forward):*
+• `stale-repo` — discarded 2 commits and fast-forwarded after 6 runs in conflict
 
 *Merge Conflicts (Manual Resolution Required):*
 • `divergent-repo` — unresolved across 4 runs (first seen 2026-06-08 09:12 UTC)

@@ -105,6 +105,96 @@ class SyncForkRecheckTests(unittest.TestCase):
         self.assertTrue(result.success)
 
 
+class ShouldAutoResolveTests(unittest.TestCase):
+    """The threshold gate for auto-resolving a long-standing conflict."""
+
+    def test_at_threshold_not_resolved(self):
+        self.assertFalse(sf.should_auto_resolve(sf.AUTO_RESOLVE_AFTER_RUNS))
+
+    def test_one_past_threshold_is_resolved(self):
+        self.assertTrue(sf.should_auto_resolve(sf.AUTO_RESOLVE_AFTER_RUNS + 1))
+
+    def test_well_under_threshold_not_resolved(self):
+        self.assertFalse(sf.should_auto_resolve(1))
+
+
+class UpstreamDivergenceTests(unittest.TestCase):
+    def test_parses_counts_and_merge_base_from_compare(self):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["path"] = request.url.path
+            return httpx.Response(
+                200,
+                json={
+                    "ahead_by": 4,  # upstream ahead of fork -> fork behind by 4
+                    "behind_by": 3,  # fork ahead of upstream -> 3 divergent commits
+                    "merge_base_commit": {"sha": "base123"},
+                },
+            )
+
+        gh = github_with(handler)
+        div = gh.upstream_divergence("me/fork", "master", "up", "main")
+        self.assertEqual(seen["path"], "/repos/me/fork/compare/master...up:main")
+        self.assertEqual(div.behind, 4)
+        self.assertEqual(div.diverged, 3)
+        self.assertEqual(div.merge_base_sha, "base123")
+
+    def test_failure_returns_none(self):
+        gh = github_with(lambda req: httpx.Response(404, json={}))
+        self.assertIsNone(gh.upstream_divergence("me/fork", "main", "up", "main"))
+
+    def test_missing_merge_base_returns_none(self):
+        gh = github_with(lambda req: httpx.Response(200, json={"ahead_by": 1, "behind_by": 1}))
+        self.assertIsNone(gh.upstream_divergence("me/fork", "main", "up", "main"))
+
+
+class ForceResolveTests(unittest.TestCase):
+    def test_reset_branch_forces_ref_update(self):
+        seen = {}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            seen["method"] = request.method
+            seen["path"] = request.url.path
+            seen["body"] = json.loads(request.content)
+            return httpx.Response(200, json={})
+
+        gh = github_with(handler)
+        gh.reset_branch("me/fork", "main", "base123")
+        self.assertEqual(seen["method"], "PATCH")
+        self.assertEqual(seen["path"], "/repos/me/fork/git/refs/heads/main")
+        self.assertEqual(seen["body"], {"sha": "base123", "force": True})
+
+    def test_resets_then_fast_forwards(self):
+        calls = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append((request.method, request.url.path))
+            if request.method == "PATCH":
+                return httpx.Response(200, json={})
+            return httpx.Response(200, json={"merge_type": "fast-forward"})
+
+        gh = github_with(handler)
+        result = gh.force_resolve("me/fork", "main", "base123")
+        self.assertTrue(result.success)
+        self.assertFalse(result.no_op)
+        self.assertEqual(calls[0], ("PATCH", "/repos/me/fork/git/refs/heads/main"))
+        self.assertEqual(calls[1], ("POST", "/repos/me/fork/merge-upstream"))
+
+    def test_failed_reset_does_not_merge(self):
+        calls = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request.method)
+            return httpx.Response(422, text="reset rejected")
+
+        gh = github_with(handler)
+        result = gh.force_resolve("me/fork", "main", "base123")
+        self.assertFalse(result.success)
+        self.assertIn("branch reset failed", result.error)
+        self.assertEqual(calls, ["PATCH"])  # never attempted the merge
+
+
 class StateRoundTripTests(unittest.TestCase):
     def setUp(self):
         self._orig = sf.STATE_FILE
@@ -184,6 +274,20 @@ class BuildReportTests(unittest.TestCase):
     def test_unknown_commit_count_bucket(self):
         report = "\n".join(sf.build_report({-1: ["fork"]}, [], [], [], []))
         self.assertIn("unknown commit count", report)
+
+    def test_force_resolved_section(self):
+        report = "\n".join(
+            sf.build_report({}, [], [], [], [], force_resolved=[("fork", 11, 3)])
+        )
+        self.assertIn("Auto-Resolved Conflicts", report)
+        self.assertIn("discarded 3 commits", report)
+        self.assertIn("after 11 runs", report)
+
+    def test_force_resolved_singular_commit(self):
+        report = "\n".join(
+            sf.build_report({}, [], [], [], [], force_resolved=[("fork", 6, 1)])
+        )
+        self.assertIn("discarded 1 commit and", report)
 
 
 if __name__ == "__main__":
