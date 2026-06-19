@@ -238,46 +238,34 @@ class StateRoundTripTests(unittest.TestCase):
             self.assertEqual(sf.load_state(), (None, {}))
 
 
-class BuildReportTests(unittest.TestCase):
+class BuildRunReportTests(unittest.TestCase):
+    def test_includes_brief_synced_line(self):
+        report = "\n".join(sf.build_run_report({3: ["a"]}, [], [], [], []))
+        self.assertIn("*Synced Repositories:* 3 commits across 1 repo", report)
+
     def test_conflict_shows_persistence_duration(self):
         report = "\n".join(
-            sf.build_report(
-                synced={},
-                conflicts=[("fork", 3, EARLIER.isoformat())],
-                errors=[],
-                resolved=[],
-                flaky=[],
-            )
+            sf.build_run_report({}, [("fork", 3, EARLIER.isoformat())], [], [], [])
         )
         self.assertIn("unresolved across 3 runs", report)
 
     def test_resolved_section_reports_self_clearing(self):
         report = "\n".join(
-            sf.build_report(
-                synced={},
-                conflicts=[],
-                errors=[],
-                resolved=[("fork", {"first_seen": EARLIER.isoformat(), "runs": 2})],
-                flaky=[],
+            sf.build_run_report(
+                {}, [], [], [("fork", {"first_seen": EARLIER.isoformat(), "runs": 2})], []
             )
         )
         self.assertIn("Cleared Since Last Run", report)
         self.assertIn("cleared without intervention after being flagged 2 runs", report)
 
     def test_flaky_section(self):
-        report = "\n".join(
-            sf.build_report({}, [], [], [], flaky=["fork"])
-        )
+        report = "\n".join(sf.build_run_report({}, [], [], [], ["fork"]))
         self.assertIn("Transient Conflicts", report)
         self.assertIn("`fork`", report)
 
-    def test_unknown_commit_count_bucket(self):
-        report = "\n".join(sf.build_report({-1: ["fork"]}, [], [], [], []))
-        self.assertIn("unknown commit count", report)
-
     def test_force_resolved_section(self):
         report = "\n".join(
-            sf.build_report({}, [], [], [], [], force_resolved=[("fork", 11, 3)])
+            sf.build_run_report({}, [], [], [], [], force_resolved=[("fork", 11, 3)])
         )
         self.assertIn("Auto-Resolved Conflicts", report)
         self.assertIn("discarded 3 commits", report)
@@ -285,9 +273,16 @@ class BuildReportTests(unittest.TestCase):
 
     def test_force_resolved_singular_commit(self):
         report = "\n".join(
-            sf.build_report({}, [], [], [], [], force_resolved=[("fork", 6, 1)])
+            sf.build_run_report({}, [], [], [], [], force_resolved=[("fork", 6, 1)])
         )
         self.assertIn("discarded 1 commit and", report)
+
+    def test_prev_day_block_precedes_brief_line(self):
+        prev = sf.build_daily_summary({"a": 5}, "2026-06-18")
+        report = "\n".join(
+            sf.build_run_report({3: ["b"]}, [], [], [], [], prev_day_lines=prev)
+        )
+        self.assertLess(report.index("Daily Sync Summary"), report.index("3 commits across 1 repo"))
 
 
 class DailySummaryTests(unittest.TestCase):

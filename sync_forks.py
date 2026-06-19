@@ -385,25 +385,30 @@ def daily_rollover(daily: dict[str, Any], today: str) -> tuple[list[str], dict[s
     return report, {}
 
 
-def build_report(
+def build_run_report(
     synced: dict[int, list[str]],
     conflicts: list[tuple[str, int, str]],
     errors: list[str],
     resolved: list[tuple[str, dict[str, Any]]],
     flaky: list[str],
     force_resolved: list[tuple[str, int, int]] | None = None,
+    prev_day_lines: list[str] | None = None,
 ) -> list[str]:
-    """Assemble the Slack report body from the run's results."""
+    """Assemble the per-run Slack message.
+
+    Order: header, the previous day's full summary (only on the first run of a new
+    day), this run's brief synced line, then the unchanged full-detail sections for
+    conflicts, cleared conflicts, transient conflicts, auto-resolved conflicts, and
+    errors. Posted every run (heartbeat).
+    """
     force_resolved = force_resolved or []
+    prev_day_lines = prev_day_lines or []
     lines = ["*GitHub Fork Sync Report*"]
-    if synced:
-        lines.append("\n*✅ Synced Repositories:*")
-        for count in sorted(synced, reverse=True):
-            repos = ", ".join(f"`{name}`" for name in synced[count])
-            if count < 0:
-                lines.append(f"• unknown commit count: {repos}")
-            else:
-                lines.append(f"• {count} {'commit' if count == 1 else 'commits'}: {repos}")
+    if prev_day_lines:
+        lines.append("")
+        lines.extend(prev_day_lines)
+    lines.append("")
+    lines.append(brief_synced_line(synced))
     if force_resolved:
         lines.append("\n*🛠️ Auto-Resolved Conflicts (divergent commits discarded to fast-forward):*")
         for name, runs, diverged in force_resolved:
