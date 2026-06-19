@@ -338,5 +338,24 @@ class BriefSyncedLineTests(unittest.TestCase):
         )
 
 
+class AccrueSyncedTests(unittest.TestCase):
+    def test_adds_new_repos(self):
+        self.assertEqual(sf.accrue_synced({}, {3: ["a"], 5: ["b"]}), {"a": 3, "b": 5})
+
+    def test_sums_repeat_repo_across_runs(self):
+        self.assertEqual(sf.accrue_synced({"a": 3}, {5: ["a"]}), {"a": 8})
+
+    def test_unknown_makes_repo_unknown(self):
+        self.assertEqual(sf.accrue_synced({"a": 3}, {-1: ["a"]}), {"a": -1})
+
+    def test_unknown_is_sticky(self):
+        self.assertEqual(sf.accrue_synced({"a": -1}, {5: ["a"]}), {"a": -1})
+
+    def test_does_not_mutate_input(self):
+        original = {"a": 3}
+        sf.accrue_synced(original, {5: ["a"]})
+        self.assertEqual(original, {"a": 3})
+
+
 if __name__ == "__main__":
     unittest.main()

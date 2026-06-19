@@ -348,6 +348,25 @@ def brief_synced_line(synced_by_count: dict[int, list[str]]) -> str:
     )
 
 
+def accrue_synced(
+    daily_synced: dict[str, int], run_synced_by_count: dict[int, list[str]]
+) -> dict[str, int]:
+    """Fold a run's `{count: [repos]}` syncs into the day's `{repo: total}` totals.
+
+    Returns a new dict (does not mutate the input). A repo's total is summed across
+    syncs; once a repo records an unknown count (`-1`) for the day it stays unknown,
+    since a true total can no longer be computed.
+    """
+    updated = dict(daily_synced)
+    for count, repos in run_synced_by_count.items():
+        for repo in repos:
+            if count < 0 or updated.get(repo, 0) < 0:
+                updated[repo] = -1
+            else:
+                updated[repo] = updated.get(repo, 0) + count
+    return updated
+
+
 def build_report(
     synced: dict[int, list[str]],
     conflicts: list[tuple[str, int, str]],
