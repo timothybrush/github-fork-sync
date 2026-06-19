@@ -13,7 +13,7 @@ If you maintain dozens — or hundreds — of forks, manually clicking "Sync for
 5. Classifies the outcome as synced, merge conflict, transient/flaky conflict (cleared on re-check), no-op (API cache artifact), or error.
 6. Tracks conflicts across runs: reports how long each has been unresolved, and flags conflicts that cleared on their own since the last run.
 7. **Auto-resolves stale conflicts.** Once a fork has been in conflict for more than 5 runs, the script discards the fork's own divergent commits — resetting its default branch to the merge-base with upstream — and fast-forwards it to the latest upstream. This is automatic and **destructive**: the fork's commits on its default branch are permanently dropped. It only triggers after a conflict has gone unresolved across 6+ runs, and applies only to your own forks.
-8. Posts a grouped Slack report — only when something actually happened.
+8. Posts a Slack report every run. Each run posts a brief one-line synced summary plus full detail for any conflicts/errors. The noisy per-repo synced list is accumulated per local-calendar day and posted once, on the first run of the next day, as a "Daily Sync Summary".
 
 Transient `429` / `5xx` responses and GitHub's secondary rate limits are retried with exponential backoff, honoring `Retry-After` when present.
 
@@ -66,36 +66,26 @@ rm sync_state.json
 
 ## Slack output
 
-The report is sent only when at least one fork was synced, hit a merge conflict, or errored. It groups synced repos by how many commits they were behind, so the most active upstreams float to the top:
+A report is posted every run (heartbeat). Each run shows a brief synced line and the full per-run detail for any conflicts, cleared conflicts, transient conflicts, auto-resolved conflicts, or errors. The verbose per-repo synced list is rolled up per local-calendar day and posted once, on the first run of the next day:
 
 ```
 *GitHub Fork Sync Report*
 
+*📅 Daily Sync Summary — 2026-06-18*
 *Synced Repositories:*
 • 14 commits: `some-repo`
 • 3 commits: `another-repo`, `third-repo`
 • 1 commit: `tiny-repo`
 
-*Auto-Resolved Conflicts (divergent commits discarded to fast-forward):*
-• `stale-repo` — discarded 2 commits and fast-forwarded after 6 runs in conflict
+*Synced Repositories:* 5 commits across 2 repos
 
-*Merge Conflicts (Manual Resolution Required):*
+*⚠️ Merge Conflicts (Manual Resolution Required):*
 • `divergent-repo` — unresolved across 4 runs (first seen 2026-06-08 09:12 UTC)
-• `new-conflict-repo` — new this run
-
-*Conflicts Cleared Since Last Run:*
-• `flapping-repo` — cleared without intervention after being flagged 2 runs (first seen 2026-06-08 08:30 UTC)
-
-*Transient Conflicts (cleared on in-run re-check):*
-• `racey-repo`
-
-*Errors Encountered:*
-• broken-repo: <error message from GitHub>
 ```
 
-The **Conflicts Cleared Since Last Run** and **Transient Conflicts** sections are the telemetry that answers "was it really a conflict?": a repo that clears on the in-run re-check was GitHub merge-state flicker, while one that clears across runs without intervention was either resolved upstream or eventual consistency. A conflict that keeps incrementing its run count is genuine and needs manual resolution.
+The dated **Daily Sync Summary** appears only on the first run of a new day and covers the previous day's syncs (each repo's commits summed across that day, grouped descending). The brief **Synced Repositories** line summarizes the current run. Conflicts and errors are never deferred — they keep full detail on the run they occur.
 
-If every fork is already up to date, no Slack notification is sent.
+The **Conflicts Cleared Since Last Run** and **Transient Conflicts** sections are the telemetry that answers "was it really a conflict?": a repo that clears on the in-run re-check was GitHub merge-state flicker, while one that clears across runs without intervention was either resolved upstream or eventual consistency. A conflict that keeps incrementing its run count is genuine and needs manual resolution.
 
 ## Automating it
 
@@ -104,5 +94,5 @@ The script is designed to be run on a schedule (cron, launchd, GitHub Actions, e
 ## Files
 
 - `sync_forks.py` — the script.
-- `sync_state.json` — last-run timestamp, written by the script (gitignored).
+- `sync_state.json` — last-run timestamp, tracked conflicts, and the current day's accumulated synced counts; written by the script (gitignored).
 - `pyproject.toml` / `uv.lock` — project metadata and pinned dependencies for `uv sync` workflows.

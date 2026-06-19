@@ -241,31 +241,41 @@ def resolve_token() -> str:
     sys.exit(1)
 
 
-def load_state() -> tuple[datetime | None, dict[str, dict[str, Any]]]:
-    """Read the last run timestamp and the forks left in conflict last run.
+def load_state() -> tuple[datetime | None, dict[str, dict[str, Any]], dict[str, Any]]:
+    """Read the last run timestamp, the forks left in conflict, and the daily block.
 
-    Tolerant of the older state format that only stored `last_run` — a missing
-    `conflicts` key simply yields an empty mapping.
+    Tolerant of older state formats: a missing `conflicts` or `daily` key simply
+    yields an empty mapping.
     """
     if not STATE_FILE.exists():
-        return None, {}
+        return None, {}, {}
     try:
         data = json.loads(STATE_FILE.read_text())
         raw_last_run = data.get("last_run")
         last_run = datetime.fromisoformat(raw_last_run) if raw_last_run else None
-        return last_run, data.get("conflicts", {})
+        return last_run, data.get("conflicts", {}), data.get("daily", {})
     except (ValueError, json.JSONDecodeError) as exc:
         console.print(
             f"[dim yellow]Warning: couldn't read state file ({exc}); forcing full check.[/]"
         )
-        return None, {}
+        return None, {}, {}
 
 
-def save_state(run_time: datetime, conflicts: dict[str, dict[str, Any]]) -> None:
-    """Persist this run's start time and any still-conflicting forks for the next run."""
+def save_state(
+    run_time: datetime, conflicts: dict[str, dict[str, Any]], daily: dict[str, Any]
+) -> None:
+    """Persist this run's start time, still-conflicting forks, and the daily block."""
     STATE_FILE.write_text(
-        json.dumps({"last_run": run_time.isoformat(), "conflicts": conflicts}, indent=2)
+        json.dumps(
+            {"last_run": run_time.isoformat(), "conflicts": conflicts, "daily": daily},
+            indent=2,
+        )
     )
+
+
+def local_today() -> str:
+    """Local calendar date (YYYY-MM-DD) used as the daily-rollup boundary."""
+    return datetime.now().astimezone().date().isoformat()
 
 
 def upstream_changed(parent: dict[str, Any], last_run: datetime | None) -> bool:
@@ -300,25 +310,115 @@ def _format_ts(iso: str) -> str:
         return iso or "unknown"
 
 
-def build_report(
+def _synced_bullets(synced_by_count: dict[int, list[str]]) -> list[str]:
+    """Render `{commit_count: [repos]}` as grouped bullets, highest count first.
+
+    Repos within a bucket are sorted by name for deterministic output. A negative
+    count is the `unknown commit count` sentinel.
+    """
+    lines: list[str] = []
+    for count in sorted(synced_by_count, reverse=True):
+        repos = ", ".join(f"`{name}`" for name in sorted(synced_by_count[count]))
+        if count < 0:
+            lines.append(f"• unknown commit count: {repos}")
+        else:
+            lines.append(f"• {count} {'commit' if count == 1 else 'commits'}: {repos}")
+    return lines
+
+
+def build_daily_summary(daily_synced: dict[str, int], date: str) -> list[str]:
+    """The dated, grouped synced report for a completed day; empty if no syncs.
+
+    `daily_synced` maps each repo's short name to its day-total commits. It is
+    inverted into the `{count: [repos]}` shape the shared bullet renderer consumes.
+    """
+    if not daily_synced:
+        return []
+    by_count: dict[int, list[str]] = {}
+    for repo, total in daily_synced.items():
+        by_count.setdefault(total, []).append(repo)
+    return [
+        f"*📅 Daily Sync Summary — {date}*",
+        "*Synced Repositories:*",
+        *_synced_bullets(by_count),
+    ]
+
+
+def brief_synced_line(synced_by_count: dict[int, list[str]]) -> str:
+    """One-line summary of this run: total commits across total repos.
+
+    Unknown-count syncs (the `-1` bucket) contribute to the repo count but not the
+    commit sum, since their true count is unknown.
+    """
+    repos = sum(len(names) for names in synced_by_count.values())
+    commits = sum(count * len(names) for count, names in synced_by_count.items() if count >= 0)
+    return (
+        f"*Synced Repositories:* {commits} {'commit' if commits == 1 else 'commits'} "
+        f"across {repos} {'repo' if repos == 1 else 'repos'}"
+    )
+
+
+def accrue_synced(
+    daily_synced: dict[str, int], run_synced_by_count: dict[int, list[str]]
+) -> dict[str, int]:
+    """Fold a run's `{count: [repos]}` syncs into the day's `{repo: total}` totals.
+
+    Returns a new dict (does not mutate the input). A repo's total is summed across
+    syncs; once a repo records an unknown count (`-1`) for the day it stays unknown,
+    since a true total can no longer be computed.
+    """
+    updated = dict(daily_synced)
+    for count, repos in run_synced_by_count.items():
+        for repo in repos:
+            if count < 0 or updated.get(repo, 0) < 0:
+                updated[repo] = -1
+            else:
+                updated[repo] = updated.get(repo, 0) + count
+    return updated
+
+
+def daily_rollover(daily: dict[str, Any], today: str) -> tuple[list[str], dict[str, int]]:
+    """Decide whether to emit the previous day's summary and reset the accumulator.
+
+    `daily` is the persisted block (`{"date": ..., "synced": {...}}`) or empty.
+    Returns `(prev_day_lines, accumulator_for_this_run)`:
+    - Same local date as `today` → no report, carry the existing accumulator forward.
+    - A different (earlier) date → report it under its own date, start fresh.
+      If whole days were skipped, accruals report under their own `date`, not "yesterday".
+    - No prior date (first ever run) → no report, fresh accumulator.
+    """
+    prev_date = daily.get("date")
+    prev_synced = daily.get("synced", {})
+    if prev_date == today:
+        return [], prev_synced
+    report = build_daily_summary(prev_synced, prev_date) if prev_date else []
+    return report, {}
+
+
+def build_run_report(
     synced: dict[int, list[str]],
     conflicts: list[tuple[str, int, str]],
     errors: list[str],
     resolved: list[tuple[str, dict[str, Any]]],
     flaky: list[str],
     force_resolved: list[tuple[str, int, int]] | None = None,
+    prev_day_lines: list[str] | None = None,
 ) -> list[str]:
-    """Assemble the Slack report body from the run's results."""
+    """Assemble the per-run Slack message.
+
+    Order: header, the previous day's full summary (only on the first run of a new
+    day), this run's brief synced line, then the unchanged full-detail sections for
+    conflicts, cleared conflicts, transient conflicts, auto-resolved conflicts, and
+    errors. Posted every run (heartbeat).
+    """
     force_resolved = force_resolved or []
+    prev_day_lines = prev_day_lines or []
     lines = ["*GitHub Fork Sync Report*"]
-    if synced:
-        lines.append("\n*✅ Synced Repositories:*")
-        for count in sorted(synced, reverse=True):
-            repos = ", ".join(f"`{name}`" for name in synced[count])
-            if count < 0:
-                lines.append(f"• unknown commit count: {repos}")
-            else:
-                lines.append(f"• {count} {'commit' if count == 1 else 'commits'}: {repos}")
+    if prev_day_lines:
+        lines.append("")
+        lines.extend(prev_day_lines)
+    lines.append("")
+    lines.append(brief_synced_line(synced))
     if force_resolved:
         lines.append("\n*🛠️ Auto-Resolved Conflicts (divergent commits discarded to fast-forward):*")
         for name, runs, diverged in force_resolved:
@@ -364,7 +464,9 @@ def notify_slack(webhook_url: str, lines: list[str]) -> None:
 
 def main() -> None:
     started_at = datetime.now(timezone.utc)
-    last_run, prior_conflicts = load_state()
+    today = local_today()
+    last_run, prior_conflicts, daily_state = load_state()
+    prev_day_lines, day_synced = daily_rollover(daily_state, today)
 
     if not (webhook_url := os.getenv("SLACK_WEBHOOK_URL")):
         console.print("[red]Error: SLACK_WEBHOOK_URL environment variable is not set.[/red]")
@@ -488,7 +590,8 @@ def main() -> None:
 
             progress.advance(task)
 
-    save_state(started_at, current_conflicts)
+    day_synced = accrue_synced(day_synced, synced_by_count)
+    save_state(started_at, current_conflicts, {"date": today, "synced": day_synced})
     console.print(
         f"\n[bold green]Sync complete. {skipped} repos bypassed via state caching.[/bold green]"
     )
@@ -507,18 +610,13 @@ def main() -> None:
             f"will be re-checked next run regardless of upstream activity.[/dim]"
         )
 
-    if synced_by_count or conflicts or errors or resolved or flaky or force_resolved:
-        console.print("Sending Slack notification…")
-        notify_slack(
-            webhook_url,
-            build_report(
-                synced_by_count, conflicts, errors, resolved, flaky, force_resolved
-            ),
-        )
-    else:
-        console.print(
-            "[bold green]All active forks are up to date. No Slack notification sent.[/bold green]"
-        )
+    console.print("Sending Slack notification…")
+    notify_slack(
+        webhook_url,
+        build_run_report(
+            synced_by_count, conflicts, errors, resolved, flaky, force_resolved, prev_day_lines
+        ),
+    )
 
 
 if __name__ == "__main__":
