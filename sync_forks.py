@@ -300,6 +300,40 @@ def _format_ts(iso: str) -> str:
         return iso or "unknown"
 
 
+def _synced_bullets(synced_by_count: dict[int, list[str]]) -> list[str]:
+    """Render `{commit_count: [repos]}` as grouped bullets, highest count first.
+
+    Repos within a bucket are sorted by name for deterministic output. A negative
+    count is the `unknown commit count` sentinel.
+    """
+    lines: list[str] = []
+    for count in sorted(synced_by_count, reverse=True):
+        repos = ", ".join(f"`{name}`" for name in sorted(synced_by_count[count]))
+        if count < 0:
+            lines.append(f"• unknown commit count: {repos}")
+        else:
+            lines.append(f"• {count} {'commit' if count == 1 else 'commits'}: {repos}")
+    return lines
+
+
+def build_daily_summary(daily_synced: dict[str, int], date: str) -> list[str]:
+    """The dated, grouped synced report for a completed day; empty if no syncs.
+
+    `daily_synced` maps each repo's short name to its day-total commits. It is
+    inverted into the `{count: [repos]}` shape the shared bullet renderer consumes.
+    """
+    if not daily_synced:
+        return []
+    by_count: dict[int, list[str]] = {}
+    for repo, total in daily_synced.items():
+        by_count.setdefault(total, []).append(repo)
+    return [
+        f"*📅 Daily Sync Summary — {date}*",
+        "*Synced Repositories:*",
+        *_synced_bullets(by_count),
+    ]
+
+
 def build_report(
     synced: dict[int, list[str]],
     conflicts: list[tuple[str, int, str]],

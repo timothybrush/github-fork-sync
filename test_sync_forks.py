@@ -290,5 +290,27 @@ class BuildReportTests(unittest.TestCase):
         self.assertIn("discarded 1 commit and", report)
 
 
+class DailySummaryTests(unittest.TestCase):
+    def test_groups_by_total_descending(self):
+        text = "\n".join(
+            sf.build_daily_summary({"repo-a": 14, "repo-b": 3, "repo-c": 3}, "2026-06-18")
+        )
+        self.assertIn("*📅 Daily Sync Summary — 2026-06-18*", text)
+        self.assertIn("• 14 commits: `repo-a`", text)
+        self.assertIn("• 3 commits: `repo-b`, `repo-c`", text)
+        self.assertLess(text.index("14 commits"), text.index("3 commits"))
+
+    def test_empty_returns_no_lines(self):
+        self.assertEqual(sf.build_daily_summary({}, "2026-06-18"), [])
+
+    def test_unknown_count_bucket(self):
+        text = "\n".join(sf.build_daily_summary({"repo-x": -1}, "2026-06-18"))
+        self.assertIn("unknown commit count: `repo-x`", text)
+
+    def test_singular_commit(self):
+        text = "\n".join(sf.build_daily_summary({"repo-a": 1}, "2026-06-18"))
+        self.assertIn("• 1 commit: `repo-a`", text)
+
+
 if __name__ == "__main__":
     unittest.main()
