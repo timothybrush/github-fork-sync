@@ -312,5 +312,31 @@ class DailySummaryTests(unittest.TestCase):
         self.assertIn("• 1 commit: `repo-a`", text)
 
 
+class BriefSyncedLineTests(unittest.TestCase):
+    def test_sums_commits_and_counts_repos(self):
+        self.assertEqual(
+            sf.brief_synced_line({14: ["a"], 3: ["b", "c"]}),
+            "*Synced Repositories:* 20 commits across 3 repos",
+        )
+
+    def test_empty_run(self):
+        self.assertEqual(
+            sf.brief_synced_line({}),
+            "*Synced Repositories:* 0 commits across 0 repos",
+        )
+
+    def test_unknown_count_counts_repo_not_commits(self):
+        self.assertEqual(
+            sf.brief_synced_line({-1: ["a"], 5: ["b"]}),
+            "*Synced Repositories:* 5 commits across 2 repos",
+        )
+
+    def test_singular(self):
+        self.assertEqual(
+            sf.brief_synced_line({1: ["a"]}),
+            "*Synced Repositories:* 1 commit across 1 repo",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -334,6 +334,20 @@ def build_daily_summary(daily_synced: dict[str, int], date: str) -> list[str]:
     ]
 
 
+def brief_synced_line(synced_by_count: dict[int, list[str]]) -> str:
+    """One-line summary of this run: total commits across total repos.
+
+    Unknown-count syncs (the `-1` bucket) contribute to the repo count but not the
+    commit sum, since their true count is unknown.
+    """
+    repos = sum(len(names) for names in synced_by_count.values())
+    commits = sum(count * len(names) for count, names in synced_by_count.items() if count >= 0)
+    return (
+        f"*Synced Repositories:* {commits} {'commit' if commits == 1 else 'commits'} "
+        f"across {repos} {'repo' if repos == 1 else 'repos'}"
+    )
+
+
 def build_report(
     synced: dict[int, list[str]],
     conflicts: list[tuple[str, int, str]],
