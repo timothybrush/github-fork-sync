@@ -464,7 +464,9 @@ def notify_slack(webhook_url: str, lines: list[str]) -> None:
 
 def main() -> None:
     started_at = datetime.now(timezone.utc)
-    last_run, prior_conflicts = load_state()
+    today = local_today()
+    last_run, prior_conflicts, daily_state = load_state()
+    prev_day_lines, day_synced = daily_rollover(daily_state, today)
 
     if not (webhook_url := os.getenv("SLACK_WEBHOOK_URL")):
         console.print("[red]Error: SLACK_WEBHOOK_URL environment variable is not set.[/red]")
@@ -588,7 +590,8 @@ def main() -> None:
 
             progress.advance(task)
 
-    save_state(started_at, current_conflicts)
+    day_synced = accrue_synced(day_synced, synced_by_count)
+    save_state(started_at, current_conflicts, {"date": today, "synced": day_synced})
     console.print(
         f"\n[bold green]Sync complete. {skipped} repos bypassed via state caching.[/bold green]"
     )
@@ -607,18 +610,13 @@ def main() -> None:
             f"will be re-checked next run regardless of upstream activity.[/dim]"
         )
 
-    if synced_by_count or conflicts or errors or resolved or flaky or force_resolved:
-        console.print("Sending Slack notification…")
-        notify_slack(
-            webhook_url,
-            build_report(
-                synced_by_count, conflicts, errors, resolved, flaky, force_resolved
-            ),
-        )
-    else:
-        console.print(
-            "[bold green]All active forks are up to date. No Slack notification sent.[/bold green]"
-        )
+    console.print("Sending Slack notification…")
+    notify_slack(
+        webhook_url,
+        build_run_report(
+            synced_by_count, conflicts, errors, resolved, flaky, force_resolved, prev_day_lines
+        ),
+    )
 
 
 if __name__ == "__main__":
