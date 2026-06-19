@@ -213,10 +213,12 @@ class StateRoundTripTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self._use_tmp(tmp)
             conflicts = {"me/fork": {"first_seen": NOW.isoformat(), "runs": 2}}
-            sf.save_state(NOW, conflicts)
-            last_run, loaded = sf.load_state()
+            daily = {"date": "2026-06-08", "synced": {"a": 3}}
+            sf.save_state(NOW, conflicts, daily)
+            last_run, loaded, loaded_daily = sf.load_state()
             self.assertEqual(last_run, NOW)
             self.assertEqual(loaded, conflicts)
+            self.assertEqual(loaded_daily, daily)
 
     def test_legacy_state_without_conflicts_key(self):
         import tempfile
@@ -225,9 +227,10 @@ class StateRoundTripTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             sf.STATE_FILE = Path(tmp) / "sync_state.json"
             sf.STATE_FILE.write_text(json.dumps({"last_run": NOW.isoformat()}))
-            last_run, loaded = sf.load_state()
+            last_run, loaded, daily = sf.load_state()
             self.assertEqual(last_run, NOW)
             self.assertEqual(loaded, {})
+            self.assertEqual(daily, {})
 
     def test_missing_file(self):
         import tempfile
@@ -235,7 +238,12 @@ class StateRoundTripTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             sf.STATE_FILE = Path(tmp) / "nope.json"
-            self.assertEqual(sf.load_state(), (None, {}))
+            self.assertEqual(sf.load_state(), (None, {}, {}))
+
+
+class LocalTodayTests(unittest.TestCase):
+    def test_returns_iso_date_string(self):
+        self.assertRegex(sf.local_today(), r"^\d{4}-\d{2}-\d{2}$")
 
 
 class BuildRunReportTests(unittest.TestCase):

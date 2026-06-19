@@ -241,31 +241,41 @@ def resolve_token() -> str:
     sys.exit(1)
 
 
-def load_state() -> tuple[datetime | None, dict[str, dict[str, Any]]]:
-    """Read the last run timestamp and the forks left in conflict last run.
+def load_state() -> tuple[datetime | None, dict[str, dict[str, Any]], dict[str, Any]]:
+    """Read the last run timestamp, the forks left in conflict, and the daily block.
 
-    Tolerant of the older state format that only stored `last_run` — a missing
-    `conflicts` key simply yields an empty mapping.
+    Tolerant of older state formats: a missing `conflicts` or `daily` key simply
+    yields an empty mapping.
     """
     if not STATE_FILE.exists():
-        return None, {}
+        return None, {}, {}
     try:
         data = json.loads(STATE_FILE.read_text())
         raw_last_run = data.get("last_run")
         last_run = datetime.fromisoformat(raw_last_run) if raw_last_run else None
-        return last_run, data.get("conflicts", {})
+        return last_run, data.get("conflicts", {}), data.get("daily", {})
     except (ValueError, json.JSONDecodeError) as exc:
         console.print(
             f"[dim yellow]Warning: couldn't read state file ({exc}); forcing full check.[/]"
         )
-        return None, {}
+        return None, {}, {}
 
 
-def save_state(run_time: datetime, conflicts: dict[str, dict[str, Any]]) -> None:
-    """Persist this run's start time and any still-conflicting forks for the next run."""
+def save_state(
+    run_time: datetime, conflicts: dict[str, dict[str, Any]], daily: dict[str, Any]
+) -> None:
+    """Persist this run's start time, still-conflicting forks, and the daily block."""
     STATE_FILE.write_text(
-        json.dumps({"last_run": run_time.isoformat(), "conflicts": conflicts}, indent=2)
+        json.dumps(
+            {"last_run": run_time.isoformat(), "conflicts": conflicts, "daily": daily},
+            indent=2,
+        )
     )
+
+
+def local_today() -> str:
+    """Local calendar date (YYYY-MM-DD) used as the daily-rollup boundary."""
+    return datetime.now().astimezone().date().isoformat()
 
 
 def upstream_changed(parent: dict[str, Any], last_run: datetime | None) -> bool:
