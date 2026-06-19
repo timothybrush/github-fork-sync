@@ -367,6 +367,24 @@ def accrue_synced(
     return updated
 
 
+def daily_rollover(daily: dict[str, Any], today: str) -> tuple[list[str], dict[str, int]]:
+    """Decide whether to emit the previous day's summary and reset the accumulator.
+
+    `daily` is the persisted block (`{"date": ..., "synced": {...}}`) or empty.
+    Returns `(prev_day_lines, accumulator_for_this_run)`:
+    - Same local date as `today` → no report, carry the existing accumulator forward.
+    - A different (earlier) date → report it under its own date, start fresh.
+      If whole days were skipped, accruals report under their own `date`, not "yesterday".
+    - No prior date (first ever run) → no report, fresh accumulator.
+    """
+    prev_date = daily.get("date")
+    prev_synced = daily.get("synced", {})
+    if prev_date == today:
+        return [], prev_synced
+    report = build_daily_summary(prev_synced, prev_date) if prev_date else []
+    return report, {}
+
+
 def build_report(
     synced: dict[int, list[str]],
     conflicts: list[tuple[str, int, str]],

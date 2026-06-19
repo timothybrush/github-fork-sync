@@ -357,5 +357,32 @@ class AccrueSyncedTests(unittest.TestCase):
         self.assertEqual(original, {"a": 3})
 
 
+class DailyRolloverTests(unittest.TestCase):
+    def test_same_day_carries_accumulator(self):
+        report, acc = sf.daily_rollover({"date": "2026-06-19", "synced": {"a": 3}}, "2026-06-19")
+        self.assertEqual(report, [])
+        self.assertEqual(acc, {"a": 3})
+
+    def test_new_day_reports_and_resets(self):
+        report, acc = sf.daily_rollover({"date": "2026-06-18", "synced": {"a": 3}}, "2026-06-19")
+        self.assertIn("Daily Sync Summary — 2026-06-18", "\n".join(report))
+        self.assertEqual(acc, {})
+
+    def test_new_day_with_no_accruals_no_report(self):
+        report, acc = sf.daily_rollover({"date": "2026-06-18", "synced": {}}, "2026-06-19")
+        self.assertEqual(report, [])
+        self.assertEqual(acc, {})
+
+    def test_first_ever_run_no_report(self):
+        report, acc = sf.daily_rollover({}, "2026-06-19")
+        self.assertEqual(report, [])
+        self.assertEqual(acc, {})
+
+    def test_multi_day_gap_reports_under_accrual_date(self):
+        report, acc = sf.daily_rollover({"date": "2026-06-15", "synced": {"a": 2}}, "2026-06-19")
+        self.assertIn("2026-06-15", "\n".join(report))
+        self.assertEqual(acc, {})
+
+
 if __name__ == "__main__":
     unittest.main()
